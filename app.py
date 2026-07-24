@@ -112,12 +112,51 @@ def registrar_sessao_concluida(nome):
 
 
 # ---------------------------------------------------------------------------
-# ACESSO PAGO (código liberado após a compra no Stripe)
+# ACESSO PAGO (código liberado após a compra) — guardado no Google Sheets
 # ---------------------------------------------------------------------------
 CODIGOS_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codigos_acesso.json")
+COLUNAS_CODIGOS = ["codigo", "usado", "usado_por", "data_uso"]
+
+
+def _sheets_disponivel():
+    return "gcp_service_account" in st.secrets and "planilha_codigos_id" in st.secrets
+
+
+def _obter_worksheet_codigos():
+    """Conecta na planilha do Google usando a conta de serviço guardada nos
+    secrets do Streamlit. Retorna None se não estiver configurado (nesse
+    caso, as funções abaixo caem para o arquivo local automaticamente)."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    escopos = ["https://www.googleapis.com/auth/spreadsheets"]
+    credenciais = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=escopos)
+    cliente = gspread.authorize(credenciais)
+    planilha = cliente.open_by_key(st.secrets["planilha_codigos_id"])
+    try:
+        aba = planilha.worksheet("codigos")
+    except gspread.WorksheetNotFound:
+        aba = planilha.add_worksheet("codigos", rows=200, cols=len(COLUNAS_CODIGOS))
+        aba.update([COLUNAS_CODIGOS])
+    return aba
 
 
 def carregar_codigos():
+    if _sheets_disponivel():
+        aba = _obter_worksheet_codigos()
+        registros = aba.get_all_records()
+        codigos = {}
+        for linha in registros:
+            codigo = str(linha.get("codigo", "")).strip().upper()
+            if not codigo:
+                continue
+            codigos[codigo] = {
+                "usado": str(linha.get("usado", "")).strip().upper() == "TRUE",
+                "usado_por": linha.get("usado_por") or None,
+                "data_uso": linha.get("data_uso") or None,
+            }
+        return codigos
+
     if os.path.exists(CODIGOS_ARQUIVO):
         try:
             with open(CODIGOS_ARQUIVO, "r", encoding="utf-8") as f:
@@ -128,6 +167,20 @@ def carregar_codigos():
 
 
 def salvar_codigos(codigos):
+    if _sheets_disponivel():
+        aba = _obter_worksheet_codigos()
+        linhas = [COLUNAS_CODIGOS]
+        for codigo, dados in codigos.items():
+            linhas.append([
+                codigo,
+                "TRUE" if dados.get("usado") else "FALSE",
+                dados.get("usado_por") or "",
+                dados.get("data_uso") or "",
+            ])
+        aba.clear()
+        aba.update(linhas)
+        return
+
     with open(CODIGOS_ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(codigos, f, ensure_ascii=False, indent=2)
 
@@ -151,6 +204,7 @@ def validar_codigo(codigo, nome_comprador):
         registro["data_uso"] = datetime.now().strftime("%d/%m/%Y %H:%M")
         salvar_codigos(codigos)
     return True, "Acesso liberado!"
+
 
 
 # ---------------------------------------------------------------------------
