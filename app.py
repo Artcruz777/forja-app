@@ -268,6 +268,28 @@ def calcular_patente(dias_treinados):
     return atual, proxima
 
 
+CONQUISTAS_DISPONIVEIS = [
+    ("primeira_semana", "🗓️", "Primeira semana", lambda p, streak_atual, melhor_streak: len(p.get("datas_treinos", [])) >= 7),
+    ("primeiro_mes", "📅", "Primeiro mês", lambda p, streak_atual, melhor_streak: len(p.get("datas_treinos", [])) >= 30),
+    ("sequencia_7", "🔥", "7 dias seguidos", lambda p, streak_atual, melhor_streak: melhor_streak >= 7),
+    ("cem_treinos", "💯", "100 treinos", lambda p, streak_atual, melhor_streak: p.get("sessoes_concluidas", 0) >= 100),
+    ("fim_de_semana", "🏋️", "Guerreiro de fim de semana",
+     lambda p, streak_atual, melhor_streak: any(
+         datetime.strptime(d, "%Y-%m-%d").weekday() >= 5 for d in p.get("datas_treinos", [])
+     )),
+]
+
+
+def calcular_conquistas(perfil):
+    _, melhor_streak = calcular_streak(perfil.get("datas_treinos", []))
+    streak_atual, _ = calcular_streak(perfil.get("datas_treinos", []))
+    conquistadas = []
+    for chave, emoji, titulo, condicao in CONQUISTAS_DISPONIVEIS:
+        if condicao(perfil, streak_atual, melhor_streak):
+            conquistadas.append((emoji, titulo))
+    return conquistadas
+
+
 def montar_cartao_patente(dias_treinados):
     (limite_atual, nome_atual, emoji_atual, desc_atual), proxima = calcular_patente(dias_treinados)
     if proxima:
@@ -292,6 +314,81 @@ def montar_cartao_patente(dias_treinados):
       <div style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#4A5560;">{rodape}</div>
     </div>
     """
+
+
+def _carregar_fonte(negrito, tamanho):
+    caminhos = (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if negrito
+        else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    )
+    from PIL import ImageFont
+    for caminho in caminhos:
+        try:
+            return ImageFont.truetype(caminho, tamanho)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def montar_imagem_patente(nome, nome_patente, streak_atual, melhor_streak, dias_treinados, sessoes_concluidas):
+    """Gera um card quadrado (1080x1080) pra compartilhar nas redes sociais,
+    mostrando a patente atual e as estatísticas de treino."""
+    from PIL import Image, ImageDraw
+    import io
+
+    LARGURA = ALTURA = 1080
+    INK = (18, 24, 31)
+    INK_2 = (27, 35, 44)
+    BONE = (237, 232, 221)
+    BONE_DIM = (168, 163, 150)
+    EMBER = (232, 163, 61)
+    LINE = (44, 53, 66)
+
+    img = Image.new("RGB", (LARGURA, ALTURA), INK)
+    draw = ImageDraw.Draw(img)
+
+    fonte_marca = _carregar_fonte(True, 34)
+    fonte_patente = _carregar_fonte(True, 96)
+    fonte_nome = _carregar_fonte(True, 46)
+    fonte_label = _carregar_fonte(False, 26)
+    fonte_stat_num = _carregar_fonte(True, 58)
+    fonte_stat_label = _carregar_fonte(False, 22)
+
+    # marca FORJA (losango + texto) no topo
+    cx, cy, r = 90, 90, 26
+    draw.polygon([(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)], outline=EMBER, width=4)
+    draw.text((cx, cy), "F", font=_carregar_fonte(True, 24), fill=EMBER, anchor="mm")
+    draw.text((140, 90), "FORJA", font=fonte_marca, fill=BONE, anchor="lm")
+
+    # patente em destaque, centralizada
+    draw.text((LARGURA / 2, 430), nome_patente.upper(), font=fonte_patente, fill=EMBER, anchor="mm")
+    draw.text((LARGURA / 2, 500), nome, font=fonte_nome, fill=BONE, anchor="mm")
+
+    # cartão de estatísticas
+    topo_card = 620
+    draw.rounded_rectangle([(70, topo_card), (LARGURA - 70, topo_card + 300)], radius=18, fill=INK_2,
+                            outline=LINE, width=2)
+    stats = [
+        (f"{streak_atual}", "SEQUÊNCIA ATUAL"),
+        (f"{melhor_streak}", "MELHOR SEQUÊNCIA"),
+        (f"{dias_treinados}", "DIAS TREINADOS"),
+    ]
+    largura_col = (LARGURA - 140) / 3
+    for i, (numero, rotulo) in enumerate(stats):
+        cx_stat = 70 + largura_col * i + largura_col / 2
+        draw.text((cx_stat, topo_card + 110), numero, font=fonte_stat_num, fill=EMBER, anchor="mm")
+        draw.text((cx_stat, topo_card + 175), rotulo, font=fonte_stat_label, fill=BONE_DIM, anchor="mm")
+
+    draw.line([(70, topo_card + 220), (LARGURA - 70, topo_card + 220)], fill=LINE, width=2)
+    draw.text((LARGURA / 2, topo_card + 260), f"{sessoes_concluidas} treinos concluídos no total",
+               font=fonte_label, fill=BONE_DIM, anchor="mm")
+
+    draw.text((LARGURA / 2, ALTURA - 60), "forjaapp.com.br", font=fonte_label, fill=BONE_DIM, anchor="mm")
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 def montar_heatmap_treinos(datas_treinos, semanas=10):
@@ -950,6 +1047,34 @@ def gerar_treino(nivel_escolhido, motivos, local, equip, tipo_treino, sexo, dias
                 blocos.append({"grupo": grupo, "exercicios": lista})
         plano.append({"dia": f"Dia {i}", "blocos": blocos})
     return plano
+
+
+def trocar_exercicio(plano, params, dia_idx, bloco_idx, ex_idx):
+    """Troca um exercício específico por outro do mesmo grupo, evitando
+    repetir exercícios já usados naquele dia. Retorna True se conseguiu
+    trocar, False se não achou nenhum substituto disponível."""
+    dia = plano[dia_idx]
+    bloco = dia["blocos"][bloco_idx]
+    grupo = bloco["grupo"]
+
+    niveis_base = niveis_permitidos(params["nivel"], params["idade"], params["motivos"])
+    nivel_pref = nivel_minimo_preferido(niveis_base, params["sessoes_concluidas"])
+    ja_usados = {ex["nome"] for b in dia["blocos"] for ex in b["exercicios"]}
+
+    novos = escolher_exercicios(
+        grupo, 1, niveis_base, nivel_pref, params["local"], params["equip"], params["tipo_treino"], ja_usados,
+    )
+    if not novos:
+        return False
+
+    ex_novo = novos[0]
+    cronometrado = ex_novo.get("cronometrado", False)
+    series, carga, descanso = esquema_series(params["motivos"], cronometrado, params["sessoes_concluidas"])
+    bloco["exercicios"][ex_idx] = {
+        "nome": ex_novo["nome"], "nivel": ex_novo["nivel"], "dica": ex_novo["dica"],
+        "series": series, "carga": carga, "descanso": descanso,
+    }
+    return True
 
 
 def construir_passos_treino(dia):
@@ -1638,6 +1763,10 @@ if enviado:
         st.session_state["nome"] = nome
         st.session_state["perfil"] = perfil
         st.session_state["ver_treino_mesmo_assim"] = False
+        st.session_state["parametros_geracao"] = {
+            "nivel": nivel, "motivos": motivos_opcoes, "local": local_valor, "equip": equip,
+            "tipo_treino": tipo_treino, "idade": int(idade), "sessoes_concluidas": perfil["sessoes_concluidas"],
+        }
 
 if "plano" in st.session_state:
     plano = st.session_state["plano"]
@@ -1667,6 +1796,26 @@ if "plano" in st.session_state:
     )
     st.markdown(montar_heatmap_treinos(perfil.get("datas_treinos", [])), unsafe_allow_html=True)
     st.markdown(montar_cartao_patente(len(perfil.get("datas_treinos", []))), unsafe_allow_html=True)
+
+    conquistas = calcular_conquistas(perfil)
+    if conquistas:
+        st.markdown(
+            "".join(f"<span class='pill'>{emoji} {titulo}</span>" for emoji, titulo in conquistas),
+            unsafe_allow_html=True,
+        )
+
+    (_, _nome_patente_card, _, _), _ = calcular_patente(len(perfil.get("datas_treinos", [])))
+    _streak_atual_card, _melhor_streak_card = calcular_streak(perfil.get("datas_treinos", []))
+    imagem_patente = montar_imagem_patente(
+        usuario_logado.get("nome", ""), _nome_patente_card, _streak_atual_card, _melhor_streak_card,
+        len(perfil.get("datas_treinos", [])), perfil.get("sessoes_concluidas", 0),
+    )
+    st.download_button(
+        "📸 Baixar card pra compartilhar",
+        data=imagem_patente,
+        file_name="forja_patente.png",
+        mime="image/png",
+    )
 
     hoje_str = datetime.now().strftime("%Y-%m-%d")
     ja_treinou_hoje = hoje_str in perfil.get("datas_treinos", [])
@@ -1700,11 +1849,11 @@ if "plano" in st.session_state:
             st.session_state["modo_treino_dia"] = None
 
         abas = st.tabs([dia["dia"] for dia in plano])
-        for aba, dia in zip(abas, plano):
+        for dia_idx, (aba, dia) in enumerate(zip(abas, plano)):
             with aba:
-                for bloco in dia["blocos"]:
+                for bloco_idx, bloco in enumerate(dia["blocos"]):
                     st.markdown(f"<div class='grp-label'>{NOME_GRUPO[bloco['grupo']]}</div>", unsafe_allow_html=True)
-                    for ex in bloco["exercicios"]:
+                    for ex_idx, ex in enumerate(bloco["exercicios"]):
                         st.markdown(f"""
                             <div class="ex-card">
                               <div class="ex-top">
@@ -1724,6 +1873,15 @@ if "plano" in st.session_state:
                                 f"Ver demonstração ↗</a>",
                                 unsafe_allow_html=True,
                             )
+                        if st.button("🔄 Trocar esse exercício", key=f"trocar_{dia_idx}_{bloco_idx}_{ex_idx}"):
+                            sucesso = trocar_exercicio(
+                                st.session_state["plano"], st.session_state["parametros_geracao"],
+                                dia_idx, bloco_idx, ex_idx,
+                            )
+                            if sucesso:
+                                st.rerun()
+                            else:
+                                st.warning("Não achei outro exercício disponível pra esse grupo agora.")
 
                 if st.session_state["modo_treino_dia"] == dia["dia"]:
                     passos = construir_passos_treino(dia)
