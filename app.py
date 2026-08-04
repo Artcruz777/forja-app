@@ -1,16 +1,78 @@
+import hashlib
 import json
 import os
 import random
+import secrets
+import smtplib
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 st.set_page_config(page_title="Treino de Calistenia", page_icon="💪", layout="centered")
 
 HISTORICO_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "historico_treino.json")
 SESSOES_POR_NIVEL = 4  # a cada N treinos concluídos, o app sobe um degrau de dificuldade
+
+TEXTO_POLITICA_PRIVACIDADE = """
+**O que coletamos:** nome, email e senha (guardada de forma criptografada,
+nunca em texto puro), além do seu histórico de treinos (datas e progressão)
+e o status da sua assinatura.
+
+**Peso, altura e idade** são usados só para calcular seu treino na hora —
+não ficam salvos em nenhum lugar.
+
+**Onde fica guardado:** seus dados de conta e histórico ficam numa planilha
+do Google Sheets, acessível apenas pela conta que administra o FORJA.
+
+**Pagamentos:** processados pela Cakto; não temos acesso ao número do seu
+cartão nem dados bancários completos.
+
+**Seus direitos:** você pode pedir a exclusão da sua conta e dos seus dados
+a qualquer momento, entrando em contato pelo email de suporte do FORJA.
+
+**Cookies/URL:** não usamos cookies de rastreamento. A sessão de login fica
+apenas na memória do navegador enquanto a aba estiver aberta.
+
+_Este é um resumo simples, não um documento jurídico. Se você tiver dúvidas
+específicas sobre como seus dados são tratados, entre em contato._
+"""
+
+TEXTO_TERMOS_DE_USO = """
+**Assinatura:** o FORJA custa R$14,99/mês, com 3 dias de teste
+grátis pra novas contas. A cobrança é recorrente e automática (via Cakto),
+até você cancelar.
+
+**Cancelamento:** pode ser feito a qualquer momento diretamente na Cakto
+(no link de gerenciamento da assinatura que você recebeu por email na
+compra). Após cancelar, você mantém acesso até o fim do período já pago.
+
+**Reembolso:** segue a política padrão da Cakto para o período de
+arrependimento previsto em lei (7 dias corridos a partir da compra).
+
+**Uso aceitável:** sua conta é pessoal e intransferível. Não compartilhe
+seu login com outras pessoas.
+
+**Isenção de responsabilidade sobre saúde:** o FORJA gera sugestões de
+treino com base nas informações que você fornece, mas **não substitui
+avaliação médica ou de um profissional de educação física**. Consulte um
+médico antes de iniciar qualquer programa de exercícios, especialmente se
+você tiver condições de saúde preexistentes, estiver grávida, ou sentir
+qualquer dor incomum durante o treino — nesse caso, pare imediatamente.
+
+**Limitação de responsabilidade:** o uso do treino gerado é por sua conta
+e risco. O FORJA não se responsabiliza por lesões decorrentes da execução
+incorreta dos exercícios ou do não seguimento desta recomendação médica.
+
+_Este é um resumo simples, não um documento jurídico completo._
+"""
 
 # ---------------------------------------------------------------------------
 # VISUAL
@@ -82,7 +144,25 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # PERSISTÊNCIA (progressão automática entre sessões)
 # ---------------------------------------------------------------------------
+COLUNAS_HISTORICO = ["email", "sessoes_concluidas", "ultimo_treino", "datas_treinos"]
+
+
 def carregar_historico():
+    if _sheets_disponivel():
+        aba = _obter_worksheet("historico", COLUNAS_HISTORICO)
+        registros = aba.get_all_records()
+        historico = {}
+        for linha in registros:
+            email = str(linha.get("email", "")).strip().lower()
+            if email:
+                datas_str = linha.get("datas_treinos", "") or ""
+                historico[email] = {
+                    "sessoes_concluidas": int(linha.get("sessoes_concluidas") or 0),
+                    "ultimo_treino": linha.get("ultimo_treino") or None,
+                    "datas_treinos": [d for d in str(datas_str).split(",") if d],
+                }
+        return historico
+
     if os.path.exists(HISTORICO_ARQUIVO):
         try:
             with open(HISTORICO_ARQUIVO, "r", encoding="utf-8") as f:
@@ -93,39 +173,188 @@ def carregar_historico():
 
 
 def salvar_historico(historico):
+    if _sheets_disponivel():
+        aba = _obter_worksheet("historico", COLUNAS_HISTORICO)
+        linhas = [COLUNAS_HISTORICO]
+        for email, dados in historico.items():
+            linhas.append([
+                email,
+                str(dados.get("sessoes_concluidas", 0)),
+                dados.get("ultimo_treino") or "",
+                ",".join(dados.get("datas_treinos", [])),
+            ])
+        aba.clear()
+        aba.update(linhas)
+        return
+
     with open(HISTORICO_ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(historico, f, ensure_ascii=False, indent=2)
 
 
-def obter_perfil(historico, nome):
-    return historico.get(nome, {"sessoes_concluidas": 0, "ultimo_treino": None})
+def obter_perfil(historico, email):
+    return historico.get(email, {"sessoes_concluidas": 0, "ultimo_treino": None, "datas_treinos": []})
 
 
-def registrar_sessao_concluida(nome):
+def registrar_sessao_concluida(email):
     historico = carregar_historico()
-    perfil = obter_perfil(historico, nome)
+    perfil = obter_perfil(historico, email)
     perfil["sessoes_concluidas"] += 1
     perfil["ultimo_treino"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-    historico[nome] = perfil
+    hoje_str = datetime.now().strftime("%Y-%m-%d")
+    datas = perfil.get("datas_treinos", [])
+    if hoje_str not in datas:
+        datas.append(hoje_str)
+    perfil["datas_treinos"] = datas
+    historico[email] = perfil
     salvar_historico(historico)
     return perfil
 
 
+def calcular_streak(datas_treinos):
+    """Retorna (streak_atual, melhor_streak) a partir de uma lista de datas
+    no formato 'YYYY-MM-DD'."""
+    if not datas_treinos:
+        return 0, 0
+    dias = sorted({datetime.strptime(d, "%Y-%m-%d").date() for d in datas_treinos})
+    melhor = 1
+    sequencia = 1
+    for i in range(1, len(dias)):
+        if (dias[i] - dias[i - 1]).days == 1:
+            sequencia += 1
+        else:
+            melhor = max(melhor, sequencia)
+            sequencia = 1
+    melhor = max(melhor, sequencia)
+
+    hoje = datetime.now().date()
+    if dias[-1] not in (hoje, hoje - timedelta(days=1)):
+        return 0, melhor
+
+    streak_atual = 1
+    for i in range(len(dias) - 1, 0, -1):
+        if (dias[i] - dias[i - 1]).days == 1:
+            streak_atual += 1
+        else:
+            break
+    return streak_atual, melhor
+
+
+def montar_heatmap_treinos(datas_treinos, semanas=10):
+    """Monta uma grade tipo 'GitHub contributions' com os últimos dias,
+    marcando em qual dia a pessoa treinou."""
+    dias_totais = semanas * 7
+    hoje = datetime.now().date()
+    datas_set = set(datas_treinos)
+    inicio = hoje - timedelta(days=dias_totais - 1)
+    celulas = []
+    for i in range(dias_totais):
+        dia = inicio + timedelta(days=i)
+        treinou = dia.strftime("%Y-%m-%d") in datas_set
+        cor = "#E8A33D" if treinou else "#232d38"
+        celulas.append(
+            f'<div title="{dia.strftime("%d/%m")}" '
+            f'style="width:11px;height:11px;border-radius:2px;background:{cor};"></div>'
+        )
+    return (
+        '<div style="display:grid;grid-template-rows:repeat(7,12px);grid-auto-flow:column;gap:3px;">'
+        + "".join(celulas) + "</div>"
+    )
+
+
+COLUNAS_FEED = ["id", "email", "nome", "texto", "data", "streak", "curtidas"]
+FEED_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.json")
+
+
+def carregar_feed():
+    if _sheets_disponivel():
+        aba = _obter_worksheet("feed", COLUNAS_FEED)
+        registros = aba.get_all_records()
+        posts = []
+        for linha in registros:
+            if str(linha.get("id", "")).strip():
+                posts.append({
+                    "id": str(linha.get("id", "")),
+                    "email": linha.get("email", ""),
+                    "nome": linha.get("nome", ""),
+                    "texto": linha.get("texto", ""),
+                    "data": linha.get("data", ""),
+                    "streak": linha.get("streak", ""),
+                    "curtidas": [e for e in str(linha.get("curtidas", "")).split(",") if e],
+                })
+        return list(reversed(posts))
+
+    if os.path.exists(FEED_ARQUIVO):
+        try:
+            with open(FEED_ARQUIVO, "r", encoding="utf-8") as f:
+                return list(reversed(json.load(f)))
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def _salvar_feed_bruto(posts):
+    if _sheets_disponivel():
+        aba = _obter_worksheet("feed", COLUNAS_FEED)
+        linhas = [COLUNAS_FEED]
+        for post in posts:
+            linhas.append([
+                post["id"], post["email"], post["nome"], post["texto"], post["data"],
+                str(post.get("streak", "")), ",".join(post.get("curtidas", [])),
+            ])
+        aba.clear()
+        aba.update(linhas)
+        return
+    with open(FEED_ARQUIVO, "w", encoding="utf-8") as f:
+        json.dump(posts, f, ensure_ascii=False, indent=2)
+
+
+def publicar_no_feed(email, nome, texto, streak):
+    texto = texto.strip()
+    if not texto:
+        return False
+    posts = list(reversed(carregar_feed()))  # volta pra ordem cronológica de gravação
+    posts.append({
+        "id": secrets.token_hex(6),
+        "email": email,
+        "nome": nome,
+        "texto": texto[:280],
+        "data": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "streak": streak,
+        "curtidas": [],
+    })
+    _salvar_feed_bruto(posts)
+    return True
+
+
+def curtir_post(post_id, email):
+    posts = list(reversed(carregar_feed()))
+    for post in posts:
+        if post["id"] == post_id:
+            if email in post["curtidas"]:
+                post["curtidas"].remove(email)
+            else:
+                post["curtidas"].append(email)
+            break
+    _salvar_feed_bruto(posts)
+
+
 # ---------------------------------------------------------------------------
-# ACESSO PAGO (código liberado após a compra) — guardado no Google Sheets
+# CONTAS DE USUÁRIO + ASSINATURA — guardado no Google Sheets
 # ---------------------------------------------------------------------------
-CODIGOS_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codigos_acesso.json")
-COLUNAS_CODIGOS = ["codigo", "usado", "usado_por", "data_uso"]
+USUARIOS_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usuarios.json")
+COLUNAS_USUARIOS = ["email", "senha_hash", "senha_salt", "nome", "assinatura_status", "assinatura_valido_ate",
+                     "data_cadastro", "reset_codigo", "reset_expira", "meses_pagos"]
+
 
 
 def _sheets_disponivel():
     return "gcp_service_account" in st.secrets and "planilha_codigos_id" in st.secrets
 
 
-def _obter_worksheet_codigos():
+def _obter_worksheet(nome_aba, colunas):
     """Conecta na planilha do Google usando a conta de serviço guardada nos
-    secrets do Streamlit. Retorna None se não estiver configurado (nesse
-    caso, as funções abaixo caem para o arquivo local automaticamente)."""
+    secrets do Streamlit. Cria a aba com o cabeçalho certo se ela ainda não
+    existir."""
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -134,77 +363,209 @@ def _obter_worksheet_codigos():
     cliente = gspread.authorize(credenciais)
     planilha = cliente.open_by_key(st.secrets["planilha_codigos_id"])
     try:
-        aba = planilha.worksheet("codigos")
+        aba = planilha.worksheet(nome_aba)
     except gspread.WorksheetNotFound:
-        aba = planilha.add_worksheet("codigos", rows=200, cols=len(COLUNAS_CODIGOS))
-        aba.update([COLUNAS_CODIGOS])
+        aba = planilha.add_worksheet(nome_aba, rows=500, cols=len(colunas))
+        aba.update([colunas])
     return aba
 
 
-def carregar_codigos():
-    if _sheets_disponivel():
-        aba = _obter_worksheet_codigos()
-        registros = aba.get_all_records()
-        codigos = {}
-        for linha in registros:
-            codigo = str(linha.get("codigo", "")).strip().upper()
-            if not codigo:
-                continue
-            codigos[codigo] = {
-                "usado": str(linha.get("usado", "")).strip().upper() == "TRUE",
-                "usado_por": linha.get("usado_por") or None,
-                "data_uso": linha.get("data_uso") or None,
-            }
-        return codigos
+def _gerar_hash_senha(senha, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    hash_ = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+    return hash_, salt
 
-    if os.path.exists(CODIGOS_ARQUIVO):
+
+def _verificar_senha(senha, hash_salvo, salt):
+    hash_calc, _ = _gerar_hash_senha(senha, salt)
+    return hash_calc == hash_salvo
+
+
+def carregar_usuarios():
+    if _sheets_disponivel():
+        aba = _obter_worksheet("usuarios", COLUNAS_USUARIOS)
+        registros = aba.get_all_records()
+        usuarios = {}
+        for linha in registros:
+            email = str(linha.get("email", "")).strip().lower()
+            if email:
+                usuarios[email] = {c: linha.get(c, "") for c in COLUNAS_USUARIOS if c != "email"}
+        return usuarios
+
+    if os.path.exists(USUARIOS_ARQUIVO):
         try:
-            with open(CODIGOS_ARQUIVO, "r", encoding="utf-8") as f:
+            with open(USUARIOS_ARQUIVO, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
 
 
-def salvar_codigos(codigos):
+def salvar_usuarios(usuarios):
     if _sheets_disponivel():
-        aba = _obter_worksheet_codigos()
-        linhas = [COLUNAS_CODIGOS]
-        for codigo, dados in codigos.items():
-            linhas.append([
-                codigo,
-                "TRUE" if dados.get("usado") else "FALSE",
-                dados.get("usado_por") or "",
-                dados.get("data_uso") or "",
-            ])
+        aba = _obter_worksheet("usuarios", COLUNAS_USUARIOS)
+        linhas = [COLUNAS_USUARIOS]
+        for email, dados in usuarios.items():
+            linhas.append([email] + [str(dados.get(c, "")) for c in COLUNAS_USUARIOS if c != "email"])
         aba.clear()
         aba.update(linhas)
         return
 
-    with open(CODIGOS_ARQUIVO, "w", encoding="utf-8") as f:
-        json.dump(codigos, f, ensure_ascii=False, indent=2)
+    with open(USUARIOS_ARQUIVO, "w", encoding="utf-8") as f:
+        json.dump(usuarios, f, ensure_ascii=False, indent=2)
 
 
-def validar_codigo(codigo, nome_comprador):
-    """Retorna (True, mensagem) se o código existe e pode ser usado por essa
-    pessoa. Uma vez que um código é vinculado a um nome, a mesma pessoa pode
-    reenviar o mesmo código (ex: pelo link salvo) sem ser bloqueada; só uma
-    pessoa diferente tentando o mesmo código é que é recusada."""
-    codigo = codigo.strip().upper()
-    nome_comprador = nome_comprador.strip()
-    codigos = carregar_codigos()
-    if codigo not in codigos:
-        return False, "Código não encontrado. Confira se digitou certo."
-    registro = codigos[codigo]
-    if registro.get("usado") and registro.get("usado_por") != nome_comprador:
-        return False, "Esse código já foi usado em outro acesso."
-    if not registro.get("usado"):
-        registro["usado"] = True
-        registro["usado_por"] = nome_comprador
-        registro["data_uso"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-        salvar_codigos(codigos)
-    return True, "Acesso liberado!"
+DIAS_TESTE_GRATIS = 3
+DIAS_TOLERANCIA = 3
+PRECO_MENSAL = "R$14,99"
 
+
+def criar_conta(email, senha, nome):
+    email = email.strip().lower()
+    if not email or "@" not in email:
+        return False, "Digite um email válido."
+    usuarios = carregar_usuarios()
+    if email in usuarios:
+        return False, "Esse email já tem cadastro. Faça login na aba ao lado."
+    hash_, salt = _gerar_hash_senha(senha)
+    validade_teste = (datetime.now() + timedelta(days=DIAS_TESTE_GRATIS)).strftime("%Y-%m-%d")
+    usuarios[email] = {
+        "senha_hash": hash_,
+        "senha_salt": salt,
+        "nome": nome.strip(),
+        "assinatura_status": "teste",
+        "assinatura_valido_ate": validade_teste,
+        "data_cadastro": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "reset_codigo": "",
+        "reset_expira": "",
+        "meses_pagos": "0",
+    }
+    salvar_usuarios(usuarios)
+    return True, f"Conta criada! Você já tem {DIAS_TESTE_GRATIS} dias de teste grátis. Entre na aba \"Entrar\"."
+
+
+def autenticar(email, senha):
+    email = email.strip().lower()
+    usuarios = carregar_usuarios()
+    if email not in usuarios:
+        return False, "Email não encontrado. Crie uma conta na aba ao lado.", None
+    dados = usuarios[email]
+    if not _verificar_senha(senha, dados.get("senha_hash", ""), dados.get("senha_salt", "")):
+        return False, "Senha incorreta.", None
+    return True, "Login feito!", {"email": email, **dados}
+
+
+def status_acesso(usuario):
+    """Retorna um dict descrevendo se o acesso está liberado agora, considerando
+    teste grátis, assinatura ativa e o período de tolerância após o vencimento."""
+    status = usuario.get("assinatura_status")
+    validade_str = usuario.get("assinatura_valido_ate")
+    if status not in ("teste", "ativa") or not validade_str:
+        return {"liberado": False, "motivo": status or "sem_assinatura", "dias_restantes": 0, "em_tolerancia": False}
+
+    try:
+        validade = datetime.strptime(str(validade_str), "%Y-%m-%d").date()
+    except ValueError:
+        return {"liberado": False, "motivo": "sem_assinatura", "dias_restantes": 0, "em_tolerancia": False}
+
+    hoje = datetime.now().date()
+    fim_tolerancia = validade + timedelta(days=DIAS_TOLERANCIA)
+
+    if hoje <= validade:
+        return {"liberado": True, "motivo": status, "dias_restantes": (validade - hoje).days, "em_tolerancia": False}
+    if hoje <= fim_tolerancia:
+        return {"liberado": True, "motivo": status, "dias_restantes": (fim_tolerancia - hoje).days, "em_tolerancia": True}
+    return {"liberado": False, "motivo": "expirado", "dias_restantes": 0, "em_tolerancia": False}
+
+
+def assinatura_esta_ativa(usuario):
+    return status_acesso(usuario)["liberado"]
+
+
+def recarregar_usuario_logado():
+    """Relê os dados desse usuário na planilha — usado depois que a pessoa
+    volta do checkout, pra ver se o webhook já ativou a assinatura dela."""
+    email = st.session_state["usuario_logado"]["email"]
+    usuarios = carregar_usuarios()
+    if email in usuarios:
+        st.session_state["usuario_logado"] = {"email": email, **usuarios[email]}
+
+
+def _email_configurado():
+    return "email_remetente" in st.secrets and "email_senha_app" in st.secrets
+
+
+def _enviar_email(destinatario, assunto, corpo):
+    if not _email_configurado():
+        return False
+    remetente = st.secrets["email_remetente"]
+    senha_app = st.secrets["email_senha_app"]
+    msg = EmailMessage()
+    msg["Subject"] = assunto
+    msg["From"] = remetente
+    msg["To"] = destinatario
+    msg.set_content(corpo)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
+            servidor.login(remetente, senha_app)
+            servidor.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def solicitar_redefinicao_senha(email):
+    """Gera um código de 6 dígitos, válido por 15 minutos, e envia por email.
+    Sempre retorna a mesma mensagem (exista ou não a conta), pra não revelar
+    quais emails têm cadastro."""
+    email = email.strip().lower()
+    mensagem_padrao = "Se esse email tiver cadastro, enviamos um código de redefinição para ele."
+    usuarios = carregar_usuarios()
+    if email not in usuarios:
+        return True, mensagem_padrao
+    codigo = f"{secrets.randbelow(1000000):06d}"
+    expira = (datetime.now() + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    usuarios[email]["reset_codigo"] = codigo
+    usuarios[email]["reset_expira"] = expira
+    salvar_usuarios(usuarios)
+    enviado = _enviar_email(
+        email,
+        "Código para redefinir sua senha — FORJA",
+        f"Seu código de redefinição de senha é: {codigo}\n\n"
+        f"Ele vale por 15 minutos. Se você não pediu isso, pode ignorar este email.",
+    )
+    if not enviado:
+        return False, "Não consegui enviar o email agora. Tente de novo em instantes."
+    return True, mensagem_padrao
+
+
+def redefinir_senha(email, codigo, nova_senha):
+    email = email.strip().lower()
+    usuarios = carregar_usuarios()
+    if email not in usuarios:
+        return False, "Código inválido ou expirado."
+    dados = usuarios[email]
+    codigo_salvo = str(dados.get("reset_codigo", "") or "")
+    expira_str = dados.get("reset_expira", "") or ""
+    if not codigo_salvo or codigo.strip() != codigo_salvo:
+        return False, "Código inválido ou expirado."
+    try:
+        expira = datetime.strptime(expira_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False, "Código inválido ou expirado."
+    if datetime.now() > expira:
+        return False, "Esse código expirou. Peça um novo."
+    if len(nova_senha) < 6:
+        return False, "A nova senha precisa ter pelo menos 6 caracteres."
+    hash_, salt = _gerar_hash_senha(nova_senha)
+    dados["senha_hash"] = hash_
+    dados["senha_salt"] = salt
+    dados["reset_codigo"] = ""
+    dados["reset_expira"] = ""
+    usuarios[email] = dados
+    salvar_usuarios(usuarios)
+    return True, "Senha redefinida! Já pode entrar com a senha nova."
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +704,34 @@ NOME_GRUPO = {
 def link_video(nome_exercicio):
     query = urllib.parse.quote(f"{nome_exercicio} como fazer execução correta")
     return f"https://www.youtube.com/results?search_query={query}"
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def buscar_video_youtube(nome_exercicio):
+    """Busca o primeiro vídeo relevante via YouTube Data API, se a chave
+    estiver configurada nos secrets. Retorna None se não achar ou não tiver
+    a chave configurada (nesse caso, cai pro link de busca comum)."""
+    if requests is None or "youtube_api_key" not in st.secrets:
+        return None
+    try:
+        resposta = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "q": f"{nome_exercicio} exercício como fazer",
+                "type": "video",
+                "maxResults": 1,
+                "key": st.secrets["youtube_api_key"],
+            },
+            timeout=5,
+        )
+        dados = resposta.json()
+        itens = dados.get("items", [])
+        if itens:
+            return itens[0]["id"]["videoId"]
+    except Exception:
+        return None
+    return None
 
 
 def niveis_permitidos(nivel_escolhido, idade, motivos):
@@ -642,6 +1031,67 @@ def montar_widget_treino_guiado(passos, dia_label):
 
 
 
+def montar_pdf_treino(plano, nome_usuario):
+    """Gera um PDF com o plano de treino completo, pra baixar e imprimir."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        topMargin=1.5 * cm, bottomMargin=1.5 * cm, leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+    )
+    estilos = getSampleStyleSheet()
+    titulo_estilo = ParagraphStyle("TituloForja", parent=estilos["Title"], textColor=colors.HexColor("#12181f"))
+    subtitulo_estilo = ParagraphStyle("Sub", parent=estilos["Normal"], textColor=colors.HexColor("#6b501f"),
+                                       fontSize=10)
+    dia_estilo = ParagraphStyle("Dia", parent=estilos["Heading2"], textColor=colors.HexColor("#C1502E"))
+    grupo_estilo = ParagraphStyle("Grupo", parent=estilos["Heading4"], textColor=colors.HexColor("#12181f"))
+    aviso_estilo = ParagraphStyle("Aviso", parent=estilos["Normal"], fontSize=8, textColor=colors.HexColor("#C1502E"))
+
+    elementos = [
+        Paragraph(f"FORJA — Treino de {nome_usuario}", titulo_estilo),
+        Paragraph(f"Gerado em {datetime.now().strftime('%d/%m/%Y')}", subtitulo_estilo),
+        Spacer(1, 16),
+    ]
+
+    for dia in plano:
+        elementos.append(Paragraph(dia["dia"], dia_estilo))
+        for bloco in dia["blocos"]:
+            elementos.append(Paragraph(NOME_GRUPO[bloco["grupo"]], grupo_estilo))
+            dados_tabela = [["Exercício", "Séries x carga", "Descanso"]]
+            for ex in bloco["exercicios"]:
+                dados_tabela.append([ex["nome"], f'{ex["series"]}x {ex["carga"]}', ex["descanso"]])
+            tabela = Table(dados_tabela, colWidths=[9 * cm, 5 * cm, 3 * cm])
+            tabela.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12181f")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            elementos.append(tabela)
+            elementos.append(Spacer(1, 10))
+        elementos.append(Spacer(1, 14))
+
+    elementos.append(Paragraph(
+        "Aviso: este treino é gerado automaticamente e não substitui avaliação médica ou de um "
+        "profissional de educação física. Pare imediatamente se sentir dor incomum.",
+        aviso_estilo,
+    ))
+
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def calcular_imc(peso, altura):
     return peso / (altura ** 2)
 
@@ -708,52 +1158,193 @@ def dicas_dieta(motivos, imc, idade):
 
 
 # ---------------------------------------------------------------------------
-# TELA DE ACESSO (paga)
+# PAINEL DO DONO (acessível via ?admin=1 na URL, protegido por senha)
 # ---------------------------------------------------------------------------
-if "acesso_liberado" not in st.session_state:
-    st.session_state["acesso_liberado"] = False
+if st.query_params.get("admin") == "1":
+    st.title("📊 Painel — FORJA")
+    senha_admin = st.text_input("Senha de administrador", type="password")
+    if senha_admin and senha_admin == st.secrets.get("admin_senha", None):
+        usuarios = carregar_usuarios()
+        total = len(usuarios)
+        ativos = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "ativa")
+        em_teste = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "teste")
+        cancelados = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "cancelada")
+        receita_estimada = ativos * 14.99
+        receita_total_recebida = sum(int(u.get("meses_pagos") or 0) for u in usuarios.values()) * 14.99
 
-# Tenta liberar automaticamente se o código já estiver salvo na URL
-# (isso acontece quando a pessoa acessa por um link que ela salvou/favoritou
-# depois da primeira liberação).
-if not st.session_state["acesso_liberado"]:
-    codigo_url = st.query_params.get("codigo")
-    nome_url = st.query_params.get("nome")
-    if codigo_url and nome_url:
-        valido, _ = validar_codigo(codigo_url, nome_url)
-        if valido:
-            st.session_state["acesso_liberado"] = True
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Contas totais", total)
+        col2.metric("Assinaturas ativas", ativos)
+        col3.metric("Em teste grátis", em_teste)
+        col4.metric("Canceladas", cancelados)
 
-if not st.session_state["acesso_liberado"]:
-    st.write("Acesso ao FORJA: R$ 7,99. Pague pelo link abaixo e você recebe um código de acesso.")
-    st.link_button("Pagar R$ 7,99 e gerar meu acesso ↗", "https://pay.cakto.com.br/uga7e39_979154")
-    st.write("")
-    with st.form("codigo_form"):
-        codigo_digitado = st.text_input("Já tem um código de acesso? Digite aqui")
-        nome_comprador = st.text_input("Seu nome")
-        confirmar = st.form_submit_button("Liberar acesso")
-    if confirmar:
-        if not codigo_digitado.strip() or not nome_comprador.strip():
-            st.error("Preencha o código e o seu nome.")
-        else:
-            valido, mensagem = validar_codigo(codigo_digitado, nome_comprador.strip())
-            if valido:
-                st.session_state["acesso_liberado"] = True
-                # guarda o código na URL para não precisar digitar de novo depois
-                st.query_params["codigo"] = codigo_digitado.strip().upper()
-                st.query_params["nome"] = nome_comprador.strip()
-                st.success(mensagem)
+        col5, col6 = st.columns(2)
+        col5.metric("Receita mensal estimada", f"R$ {receita_estimada:.2f}")
+        col6.metric("Total já recebido (histórico)", f"R$ {receita_total_recebida:.2f}")
+
+        st.divider()
+        hoje = datetime.now().date()
+        vencendo = []
+        for email, dados in usuarios.items():
+            if dados.get("assinatura_status") not in ("ativa", "teste"):
+                continue
+            try:
+                validade = datetime.strptime(str(dados.get("assinatura_valido_ate", "")), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            dias_restantes = (validade - hoje).days
+            if 0 <= dias_restantes <= 3:
+                vencendo.append((dados.get("nome", ""), email, dias_restantes))
+
+        if vencendo:
+            st.subheader("⏰ Vencendo nos próximos 3 dias")
+            for nome, email, dias in sorted(vencendo, key=lambda x: x[2]):
+                st.warning(f"**{nome}** ({email}) — vence em {dias} dia(s)")
+
+        st.divider()
+        st.subheader("Lista de contas")
+        for email, dados in usuarios.items():
+            total_pago = int(dados.get("meses_pagos") or 0) * 14.99
+            st.write(
+                f"**{dados.get('nome','')}** ({email}) — status: `{dados.get('assinatura_status','')}` "
+                f"— válido até: {dados.get('assinatura_valido_ate','—')} "
+                f"— total pago: R$ {total_pago:.2f}"
+            )
+    elif senha_admin:
+        st.error("Senha incorreta.")
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# TELA DE ACESSO (login, cadastro e verificação de assinatura)
+# ---------------------------------------------------------------------------
+LINK_ASSINATURA = "https://pay.cakto.com.br/uga7e39_979154"  # troque pelo link da assinatura mensal na Cakto
+
+if "usuario_logado" not in st.session_state:
+    st.session_state["usuario_logado"] = None
+if "reset_email_enviado" not in st.session_state:
+    st.session_state["reset_email_enviado"] = None
+
+if st.session_state["usuario_logado"] is None:
+    st.write(f"Entre na sua conta FORJA ou crie uma nova — {DIAS_TESTE_GRATIS} dias de teste grátis.")
+    aba_entrar, aba_criar, aba_esqueci = st.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
+
+    with aba_entrar:
+        with st.form("login_form"):
+            email_login = st.text_input("Email", key="email_login")
+            senha_login = st.text_input("Senha", type="password", key="senha_login")
+            entrar = st.form_submit_button("Entrar")
+        if entrar:
+            ok, mensagem, usuario = autenticar(email_login, senha_login)
+            if ok:
+                st.session_state["usuario_logado"] = usuario
                 st.rerun()
             else:
                 st.error(mensagem)
+
+    with aba_criar:
+        with st.form("cadastro_form"):
+            nome_cad = st.text_input("Seu nome", key="nome_cad")
+            email_cad = st.text_input("Email", key="email_cad")
+            senha_cad = st.text_input("Crie uma senha (mín. 6 caracteres)", type="password", key="senha_cad")
+            aceite = st.checkbox(
+                "Li e aceito os Termos de Uso e a Política de Privacidade, e entendo que devo "
+                "consultar um médico antes de iniciar qualquer programa de exercícios.",
+                key="aceite_termos",
+            )
+            criar = st.form_submit_button("Criar conta")
+        if criar:
+            if not nome_cad.strip() or not email_cad.strip() or len(senha_cad) < 6:
+                st.error("Preencha nome, email e uma senha com pelo menos 6 caracteres.")
+            elif not aceite:
+                st.error("Você precisa aceitar os Termos de Uso e a Política de Privacidade pra continuar.")
+            else:
+                ok, mensagem = criar_conta(email_cad, senha_cad, nome_cad)
+                if ok:
+                    st.success(mensagem)
+                else:
+                    st.error(mensagem)
+
+    with aba_esqueci:
+        if st.session_state["reset_email_enviado"] is None:
+            with st.form("solicitar_reset_form"):
+                email_reset = st.text_input("Email da sua conta", key="email_reset")
+                pedir_codigo = st.form_submit_button("Enviar código")
+            if pedir_codigo:
+                if not email_reset.strip():
+                    st.error("Digite seu email.")
+                else:
+                    ok, mensagem = solicitar_redefinicao_senha(email_reset)
+                    st.session_state["reset_email_enviado"] = email_reset.strip().lower() if ok else None
+                    st.info(mensagem)
+                    if not _email_configurado():
+                        st.caption("(envio de email ainda não configurado nos secrets do app)")
+        else:
+            st.write(f"Digite o código enviado para **{st.session_state['reset_email_enviado']}**.")
+            with st.form("redefinir_form"):
+                codigo_reset = st.text_input("Código de 6 dígitos", key="codigo_reset")
+                nova_senha = st.text_input("Nova senha (mín. 6 caracteres)", type="password", key="nova_senha")
+                confirmar_reset = st.form_submit_button("Redefinir senha")
+            if confirmar_reset:
+                ok, mensagem = redefinir_senha(st.session_state["reset_email_enviado"], codigo_reset, nova_senha)
+                if ok:
+                    st.success(mensagem)
+                    st.session_state["reset_email_enviado"] = None
+                else:
+                    st.error(mensagem)
+            if st.button("Pedir um código novo"):
+                st.session_state["reset_email_enviado"] = None
+                st.rerun()
+
+    col_pol, col_termos = st.columns(2)
+    with col_pol:
+        with st.expander("📄 Política de privacidade"):
+            st.markdown(TEXTO_POLITICA_PRIVACIDADE)
+    with col_termos:
+        with st.expander("📄 Termos de uso"):
+            st.markdown(TEXTO_TERMOS_DE_USO)
     st.stop()
-else:
-    with st.expander("💾 Não perca seu acesso"):
-        st.write(
-            "Adicione esta página aos favoritos do seu navegador agora. "
-            "Da próxima vez que abrir por esse favorito, o acesso libera "
-            "sozinho, sem precisar digitar o código de novo."
-        )
+
+usuario_logado = st.session_state["usuario_logado"]
+status = status_acesso(usuario_logado)
+
+if not status["liberado"]:
+    st.write(f"Olá, {usuario_logado.get('nome', '')}!")
+    if status["motivo"] == "expirado":
+        st.write(f"Seu período de acesso acabou. Assine por **{PRECO_MENSAL}/mês** pra continuar.")
+    else:
+        st.write(f"Sua assinatura não está ativa ainda. Assine por **{PRECO_MENSAL}/mês** pra liberar o acesso.")
+    st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
+    st.caption(f"Use este mesmo email no checkout ({usuario_logado['email']}), pra liberação automática.")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("Já assinei, verificar de novo"):
+            recarregar_usuario_logado()
+            st.rerun()
+    with col_b:
+        if st.button("Sair da conta"):
+            st.session_state["usuario_logado"] = None
+            st.rerun()
+    st.stop()
+
+if status["em_tolerancia"]:
+    rotulo_periodo = "teste grátis" if status["motivo"] == "teste" else "assinatura"
+    st.warning(
+        f"Seu(a) {rotulo_periodo} venceu, mas você ainda tem {status['dias_restantes']} dia(s) de tolerância. "
+        f"Assine pra não perder o acesso."
+    )
+    st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
+elif status["motivo"] == "teste":
+    st.info(f"Você está no teste grátis — {status['dias_restantes']} dia(s) restante(s).")
+
+with st.expander(f"👤 {usuario_logado.get('nome','')}"):
+    if status["motivo"] == "teste":
+        st.write(f"Teste grátis válido até {usuario_logado.get('assinatura_valido_ate','')}.")
+    else:
+        st.write(f"Assinatura válida até {usuario_logado.get('assinatura_valido_ate','')}.")
+    if st.button("Sair da conta", key="sair_logado"):
+        st.session_state["usuario_logado"] = None
+        st.rerun()
 
 def escolha_unica(chave, opcoes, cols):
     """Renderiza um grid de botões de escolha única (estilo card) e
@@ -800,11 +1391,50 @@ def escolha_multipla(chave, opcoes, cols):
 # ---------------------------------------------------------------------------
 # INTERFACE
 # ---------------------------------------------------------------------------
+with st.expander("📸 Feed da comunidade — veja e compartilhe sua evolução"):
+    historico_feed = carregar_historico()
+    perfil_feed = obter_perfil(historico_feed, usuario_logado["email"])
+    streak_feed, _ = calcular_streak(perfil_feed.get("datas_treinos", []))
+
+    with st.form("post_feed_form", clear_on_submit=True):
+        texto_post = st.text_area("Compartilhe algo sobre seu treino hoje", max_chars=280, key="texto_post")
+        publicar = st.form_submit_button("Publicar")
+    if publicar:
+        if publicar_no_feed(usuario_logado["email"], usuario_logado.get("nome", ""), texto_post, streak_feed):
+            st.success("Publicado!")
+            st.rerun()
+        else:
+            st.error("Escreva algo antes de publicar.")
+
+    st.divider()
+    posts = carregar_feed()
+    if not posts:
+        st.caption("Ainda não tem nenhuma publicação. Seja a primeira pessoa a compartilhar!")
+    for post in posts[:30]:
+        curtidas = post.get("curtidas", [])
+        ja_curtiu = usuario_logado["email"] in curtidas
+        st.markdown(
+            f"<div class='ex-card'><div class='ex-top'>"
+            f"<span class='ex-nome'>{post['nome']}</span>"
+            f"<span class='ex-scheme'>🔥 {post.get('streak','0')} dia(s)</span>"
+            f"</div><div class='ex-dica' style='margin-top:6px;'>{post['texto']}</div>"
+            f"<div class='ex-dica' style='margin-top:6px;color:#4A5560;'>{post['data']}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        col_like, _ = st.columns([1, 5])
+        with col_like:
+            rotulo = f"❤ {len(curtidas)}" if not ja_curtiu else f"💔 {len(curtidas)}"
+            if st.button(rotulo, key=f"like_{post['id']}"):
+                curtir_post(post["id"], usuario_logado["email"])
+                st.rerun()
+
 st.write("Preencha seus dados e receba um plano de treino semanal que evolui sozinho a cada treino concluído.")
 
 with st.container(border=True):
     st.markdown("<div class='onb-eyebrow'>00 — DADOS PESSOAIS</div>", unsafe_allow_html=True)
-    nome = st.text_input("Seu nome (usado para salvar seu progresso)", value=st.session_state.get("onb_nome", "Você"))
+    nome = usuario_logado.get("nome", "")
+    st.write(f"Treinando como **{nome}**")
     col1, col2 = st.columns(2)
     with col1:
         peso = st.number_input("Peso (kg)", min_value=30.0, max_value=250.0, value=70.0, step=0.5)
@@ -888,11 +1518,9 @@ if enviado:
         st.error("Escolha o tipo de treino.")
     elif not local_valor:
         st.error("Escolha o local de treino.")
-    elif not nome.strip():
-        st.error("Digite um nome para salvarmos seu progresso.")
     else:
         historico = carregar_historico()
-        perfil = obter_perfil(historico, nome.strip())
+        perfil = obter_perfil(historico, usuario_logado["email"])
         imc = calcular_imc(peso, altura)
         motivos_opcoes = list(objetivos)
         plano = gerar_treino(
@@ -904,7 +1532,7 @@ if enviado:
         st.session_state["imc"] = imc
         st.session_state["motivos"] = motivos_opcoes
         st.session_state["idade"] = idade
-        st.session_state["nome"] = nome.strip()
+        st.session_state["nome"] = nome
         st.session_state["perfil"] = perfil
 
 if "plano" in st.session_state:
@@ -912,7 +1540,7 @@ if "plano" in st.session_state:
     imc = st.session_state["imc"]
     motivos_opcoes = st.session_state["motivos"]
     idade = st.session_state["idade"]
-    nome_atual = st.session_state["nome"]
+    nome_atual = usuario_logado["email"]
     perfil = st.session_state["perfil"]
 
     st.divider()
@@ -927,7 +1555,22 @@ if "plano" in st.session_state:
     )
     st.progress((sessoes % SESSOES_POR_NIVEL) / SESSOES_POR_NIVEL)
 
+    streak_atual, melhor_streak = calcular_streak(perfil.get("datas_treinos", []))
+    st.markdown(
+        f"<span class='pill'>🔥 sequência atual: {streak_atual} dia(s)</span>"
+        f"<span class='pill'>🏆 melhor sequência: {melhor_streak} dia(s)</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(montar_heatmap_treinos(perfil.get("datas_treinos", [])), unsafe_allow_html=True)
+
     st.subheader("Seu plano semanal")
+    pdf_bytes = montar_pdf_treino(plano, usuario_logado.get("nome", ""))
+    st.download_button(
+        "📄 Baixar treino em PDF",
+        data=pdf_bytes,
+        file_name="forja_treino.pdf",
+        mime="application/pdf",
+    )
     if "modo_treino_dia" not in st.session_state:
         st.session_state["modo_treino_dia"] = None
 
@@ -937,7 +1580,6 @@ if "plano" in st.session_state:
             for bloco in dia["blocos"]:
                 st.markdown(f"<div class='grp-label'>{NOME_GRUPO[bloco['grupo']]}</div>", unsafe_allow_html=True)
                 for ex in bloco["exercicios"]:
-                    video = link_video(ex["nome"])
                     st.markdown(f"""
                         <div class="ex-card">
                           <div class="ex-top">
@@ -945,9 +1587,18 @@ if "plano" in st.session_state:
                             <span class="ex-scheme">{ex['series']}x {ex['carga']} · descanso {ex['descanso']}</span>
                           </div>
                           <div class="ex-dica">{ex['dica']}</div>
-                          <a class="ex-link" href="{video}" target="_blank">Ver demonstração ↗</a>
                         </div>
                         """, unsafe_allow_html=True)
+                    video_id = buscar_video_youtube(ex["nome"])
+                    if video_id:
+                        with st.expander(f"▶ Ver demonstração — {ex['nome']}"):
+                            st.video(f"https://www.youtube.com/watch?v={video_id}")
+                    else:
+                        st.markdown(
+                            f"<a class='ex-link' href='{link_video(ex['nome'])}' target='_blank'>"
+                            f"Ver demonstração ↗</a>",
+                            unsafe_allow_html=True,
+                        )
 
             if st.session_state["modo_treino_dia"] == dia["dia"]:
                 passos = construir_passos_treino(dia)
@@ -971,3 +1622,9 @@ if "plano" in st.session_state:
     st.subheader("Dicas de dieta")
     for dica in dicas_dieta(motivos_opcoes, imc, idade):
         st.write(f"- {dica}")
+
+    st.divider()
+    st.caption(
+        "⚠️ Este treino é gerado automaticamente e não substitui avaliação médica ou de um "
+        "profissional de educação física. Pare imediatamente se sentir dor incomum."
+    )
