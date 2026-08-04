@@ -87,10 +87,16 @@ h1, h2, h3 { font-family: 'Bebas Neue', sans-serif !important; letter-spacing: 0
 p, span, label, .stMarkdown, div { color: #EDE8DD; }
 .stCaption, small { color: #a8a396 !important; }
 
-.forja-header { display:flex; align-items:center; gap:14px; margin-bottom:2px; }
+.forja-header { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:2px; }
+.forja-brand { display:flex; align-items:center; gap:14px; }
 .forja-mark { width:38px; height:38px; flex:none; border:2px solid #E8A33D; display:flex; align-items:center;
   justify-content:center; font-family:'Bebas Neue',sans-serif; font-size:18px; color:#E8A33D; transform:rotate(45deg); }
 .forja-mark span { transform:rotate(-45deg); display:block; }
+.forja-profile { display:flex; align-items:center; gap:8px; font-family:'JetBrains Mono',monospace; font-size:12px;
+  color:#a8a396; }
+.forja-profile .patente-emoji { font-size:17px; }
+.forja-profile .nome { color:#EDE8DD; font-weight:600; }
+.forja-profile .patente-nome { color:#E8A33D; }
 
 div[data-testid="stForm"] { background:#1b232c; border:1px solid #2c3542; border-radius:8px; padding:20px; }
 .stTabs [data-baseweb="tab-list"] { gap: 4px; }
@@ -136,10 +142,6 @@ div[data-testid="stVerticalBlockBorderWrapper"] .stCaption {
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown(
-    "<div class='forja-header'><div class='forja-mark'><span>F</span></div><h1 style='margin:0;'>FORJA</h1></div>",
-    unsafe_allow_html=True,
-)
 
 # ---------------------------------------------------------------------------
 # PERSISTÊNCIA (progressão automática entre sessões)
@@ -1289,12 +1291,32 @@ if st.query_params.get("admin") == "1":
 # ---------------------------------------------------------------------------
 LINK_ASSINATURA = "https://pay.cakto.com.br/uga7e39_979154"  # troque pelo link da assinatura mensal na Cakto
 
+
+def montar_cabecalho(nome=None, emoji_patente=None, nome_patente=None):
+    lado_direito = ""
+    if nome:
+        lado_direito = (
+            "<div class='forja-profile'>"
+            + (f"<span class='patente-emoji'>{emoji_patente}</span>" if emoji_patente else "")
+            + f"<span class='nome'>{nome}</span>"
+            + (f"<span class='patente-nome'>· {nome_patente}</span>" if nome_patente else "")
+            + "</div>"
+        )
+    return (
+        "<div class='forja-header'>"
+        "<div class='forja-brand'><div class='forja-mark'><span>F</span></div>"
+        "<h1 style='margin:0;'>FORJA</h1></div>"
+        f"{lado_direito}</div>"
+    )
+
+
 if "usuario_logado" not in st.session_state:
     st.session_state["usuario_logado"] = None
 if "reset_email_enviado" not in st.session_state:
     st.session_state["reset_email_enviado"] = None
 
 if st.session_state["usuario_logado"] is None:
+    st.markdown(montar_cabecalho(), unsafe_allow_html=True)
     st.write(f"Entre na sua conta FORJA ou crie uma nova — {DIAS_TESTE_GRATIS} dias de teste grátis.")
     aba_entrar, aba_criar, aba_esqueci = st.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
 
@@ -1377,6 +1399,14 @@ if st.session_state["usuario_logado"] is None:
 usuario_logado = st.session_state["usuario_logado"]
 status = status_acesso(usuario_logado)
 
+_historico_cabecalho = carregar_historico()
+_perfil_cabecalho = obter_perfil(_historico_cabecalho, usuario_logado["email"])
+(_, _nome_patente, _emoji_patente, _), _ = calcular_patente(len(_perfil_cabecalho.get("datas_treinos", [])))
+st.markdown(
+    montar_cabecalho(usuario_logado.get("nome", ""), _emoji_patente, _nome_patente),
+    unsafe_allow_html=True,
+)
+
 if not status["liberado"]:
     st.write(f"Olá, {usuario_logado.get('nome', '')}!")
     if status["motivo"] == "expirado":
@@ -1404,7 +1434,11 @@ if status["em_tolerancia"]:
     )
     st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
 elif status["motivo"] == "teste":
-    st.info(f"Você está no teste grátis — {status['dias_restantes']} dia(s) restante(s).")
+    col_info, col_btn = st.columns([2, 1])
+    with col_info:
+        st.info(f"Você está no teste grátis — {status['dias_restantes']} dia(s) restante(s).")
+    with col_btn:
+        st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
 
 with st.expander(f"👤 {usuario_logado.get('nome','')}"):
     if status["motivo"] == "teste":
