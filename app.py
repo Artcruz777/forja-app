@@ -147,6 +147,7 @@ st.markdown(
 COLUNAS_HISTORICO = ["email", "sessoes_concluidas", "ultimo_treino", "datas_treinos"]
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def carregar_historico():
     if _sheets_disponivel():
         aba = _obter_worksheet("historico", COLUNAS_HISTORICO)
@@ -185,10 +186,12 @@ def salvar_historico(historico):
             ])
         aba.clear()
         aba.update(linhas)
+        carregar_historico.clear()
         return
 
     with open(HISTORICO_ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(historico, f, ensure_ascii=False, indent=2)
+    carregar_historico.clear()
 
 
 def obter_perfil(historico, email):
@@ -265,6 +268,7 @@ COLUNAS_FEED = ["id", "email", "nome", "texto", "data", "streak", "curtidas"]
 FEED_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feed.json")
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def carregar_feed():
     if _sheets_disponivel():
         aba = _obter_worksheet("feed", COLUNAS_FEED)
@@ -303,9 +307,11 @@ def _salvar_feed_bruto(posts):
             ])
         aba.clear()
         aba.update(linhas)
+        carregar_feed.clear()
         return
     with open(FEED_ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(posts, f, ensure_ascii=False, indent=2)
+    carregar_feed.clear()
 
 
 def publicar_no_feed(email, nome, texto, streak):
@@ -351,17 +357,26 @@ def _sheets_disponivel():
     return "gcp_service_account" in st.secrets and "planilha_codigos_id" in st.secrets
 
 
-def _obter_worksheet(nome_aba, colunas):
-    """Conecta na planilha do Google usando a conta de serviço guardada nos
-    secrets do Streamlit. Cria a aba com o cabeçalho certo se ela ainda não
-    existir."""
+@st.cache_resource(show_spinner=False)
+def _conectar_planilha():
+    """Abre a conexão com a planilha UMA vez só e guarda em cache — abrir a
+    planilha de novo a cada chamada é o que estourava a cota de leitura da
+    API do Google."""
     import gspread
     from google.oauth2.service_account import Credentials
 
     escopos = ["https://www.googleapis.com/auth/spreadsheets"]
     credenciais = Credentials.from_service_account_info(dict(st.secrets["gcp_service_account"]), scopes=escopos)
     cliente = gspread.authorize(credenciais)
-    planilha = cliente.open_by_key(st.secrets["planilha_codigos_id"])
+    return cliente.open_by_key(st.secrets["planilha_codigos_id"])
+
+
+def _obter_worksheet(nome_aba, colunas):
+    """Pega a aba certa dentro da planilha (já conectada e em cache). Cria
+    a aba com o cabeçalho certo se ela ainda não existir."""
+    import gspread
+
+    planilha = _conectar_planilha()
     try:
         aba = planilha.worksheet(nome_aba)
     except gspread.WorksheetNotFound:
@@ -382,6 +397,7 @@ def _verificar_senha(senha, hash_salvo, salt):
     return hash_calc == hash_salvo
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def carregar_usuarios():
     if _sheets_disponivel():
         aba = _obter_worksheet("usuarios", COLUNAS_USUARIOS)
@@ -410,10 +426,12 @@ def salvar_usuarios(usuarios):
             linhas.append([email] + [str(dados.get(c, "")) for c in COLUNAS_USUARIOS if c != "email"])
         aba.clear()
         aba.update(linhas)
+        carregar_usuarios.clear()
         return
 
     with open(USUARIOS_ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(usuarios, f, ensure_ascii=False, indent=2)
+    carregar_usuarios.clear()
 
 
 DIAS_TESTE_GRATIS = 3
@@ -487,6 +505,7 @@ def recarregar_usuario_logado():
     """Relê os dados desse usuário na planilha — usado depois que a pessoa
     volta do checkout, pra ver se o webhook já ativou a assinatura dela."""
     email = st.session_state["usuario_logado"]["email"]
+    carregar_usuarios.clear()  # força ler o dado mais atual, ignorando o cache
     usuarios = carregar_usuarios()
     if email in usuarios:
         st.session_state["usuario_logado"] = {"email": email, **usuarios[email]}
