@@ -242,6 +242,56 @@ def calcular_streak(datas_treinos):
     return streak_atual, melhor
 
 
+PATENTES = [
+    (0, "Ferro", "🔩", "recém-chegado à forja"),
+    (5, "Bronze", "🥉", "já sente o calor do treino"),
+    (15, "Aço", "⚙️", "treino virou rotina"),
+    (30, "Titânio", "💠", "disciplina de verdade"),
+    (60, "Lenda", "🏆", "poucos chegam aqui"),
+]
+
+
+def calcular_patente(dias_treinados):
+    """Retorna (patente_atual, proxima_patente) com base em quantos dias
+    diferentes a pessoa já treinou. proxima_patente é None se já estiver
+    na patente máxima."""
+    atual = PATENTES[0]
+    proxima = None
+    for limite, nome, emoji, desc in PATENTES:
+        if dias_treinados >= limite:
+            atual = (limite, nome, emoji, desc)
+        else:
+            proxima = (limite, nome, emoji, desc)
+            break
+    return atual, proxima
+
+
+def montar_cartao_patente(dias_treinados):
+    (limite_atual, nome_atual, emoji_atual, desc_atual), proxima = calcular_patente(dias_treinados)
+    if proxima:
+        limite_prox, nome_prox, emoji_prox, _ = proxima
+        faltam = limite_prox - dias_treinados
+        progresso = (dias_treinados - limite_atual) / (limite_prox - limite_atual)
+        rodape = f"faltam {faltam} dia(s) treinados pra virar {nome_prox} {emoji_prox}"
+    else:
+        progresso = 1.0
+        rodape = "patente máxima — você é uma lenda no FORJA"
+
+    return f"""
+    <div class="card" style="text-align:center;">
+      <div style="font-size:40px;">{emoji_atual}</div>
+      <div style="font-family:'Bebas Neue',sans-serif;font-size:24px;color:#E8A33D;letter-spacing:1px;">
+        {nome_atual.upper()}
+      </div>
+      <div style="font-size:12px;color:#a8a396;margin-bottom:10px;">{desc_atual}</div>
+      <div style="background:#2c3542;border-radius:3px;height:6px;overflow:hidden;margin-bottom:8px;">
+        <div style="background:#E8A33D;height:100%;width:{progresso*100:.0f}%;"></div>
+      </div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#4A5560;">{rodape}</div>
+    </div>
+    """
+
+
 def montar_heatmap_treinos(datas_treinos, semanas=10):
     """Monta uma grade tipo 'GitHub contributions' com os últimos dias,
     marcando em qual dia a pessoa treinou."""
@@ -1553,6 +1603,7 @@ if enviado:
         st.session_state["idade"] = idade
         st.session_state["nome"] = nome
         st.session_state["perfil"] = perfil
+        st.session_state["ver_treino_mesmo_assim"] = False
 
 if "plano" in st.session_state:
     plano = st.session_state["plano"]
@@ -1581,61 +1632,83 @@ if "plano" in st.session_state:
         unsafe_allow_html=True,
     )
     st.markdown(montar_heatmap_treinos(perfil.get("datas_treinos", [])), unsafe_allow_html=True)
+    st.markdown(montar_cartao_patente(len(perfil.get("datas_treinos", []))), unsafe_allow_html=True)
 
-    st.subheader("Seu plano semanal")
-    pdf_bytes = montar_pdf_treino(plano, usuario_logado.get("nome", ""))
-    st.download_button(
-        "📄 Baixar treino em PDF",
-        data=pdf_bytes,
-        file_name="forja_treino.pdf",
-        mime="application/pdf",
-    )
-    if "modo_treino_dia" not in st.session_state:
-        st.session_state["modo_treino_dia"] = None
+    hoje_str = datetime.now().strftime("%Y-%m-%d")
+    ja_treinou_hoje = hoje_str in perfil.get("datas_treinos", [])
+    if "ver_treino_mesmo_assim" not in st.session_state:
+        st.session_state["ver_treino_mesmo_assim"] = False
 
-    abas = st.tabs([dia["dia"] for dia in plano])
-    for aba, dia in zip(abas, plano):
-        with aba:
-            for bloco in dia["blocos"]:
-                st.markdown(f"<div class='grp-label'>{NOME_GRUPO[bloco['grupo']]}</div>", unsafe_allow_html=True)
-                for ex in bloco["exercicios"]:
-                    st.markdown(f"""
-                        <div class="ex-card">
-                          <div class="ex-top">
-                            <span class="ex-nome">{ex['nome']}<span class="ex-nivel">{'●' * ex['nivel']}</span></span>
-                            <span class="ex-scheme">{ex['series']}x {ex['carga']} · descanso {ex['descanso']}</span>
-                          </div>
-                          <div class="ex-dica">{ex['dica']}</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                    video_id = buscar_video_youtube(ex["nome"])
-                    if video_id:
-                        with st.expander(f"▶ Ver demonstração — {ex['nome']}"):
-                            st.video(f"https://www.youtube.com/watch?v={video_id}")
-                    else:
-                        st.markdown(
-                            f"<a class='ex-link' href='{link_video(ex['nome'])}' target='_blank'>"
-                            f"Ver demonstração ↗</a>",
-                            unsafe_allow_html=True,
-                        )
+    if ja_treinou_hoje and not st.session_state["ver_treino_mesmo_assim"]:
+        st.divider()
+        st.markdown(
+            "<div style='text-align:center;padding:30px 10px;'>"
+            "<div style='font-family:\"Bebas Neue\",sans-serif;font-size:34px;color:#E8A33D;'>"
+            "✓ Treino de hoje concluído!</div>"
+            "<div style='color:#a8a396;font-size:14px;margin-top:8px;'>"
+            "Bom trabalho. Descanse e volte amanhã pro próximo treino.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if st.button("Ver o treino de hoje mesmo assim"):
+            st.session_state["ver_treino_mesmo_assim"] = True
+            st.rerun()
+    else:
+        st.subheader("Seu plano semanal")
+        pdf_bytes = montar_pdf_treino(plano, usuario_logado.get("nome", ""))
+        st.download_button(
+            "📄 Baixar treino em PDF",
+            data=pdf_bytes,
+            file_name="forja_treino.pdf",
+            mime="application/pdf",
+        )
+        if "modo_treino_dia" not in st.session_state:
+            st.session_state["modo_treino_dia"] = None
 
-            if st.session_state["modo_treino_dia"] == dia["dia"]:
-                passos = construir_passos_treino(dia)
-                components.html(montar_widget_treino_guiado(passos, dia["dia"]), height=560, scrolling=False)
-                if st.button("Sair do modo guiado", key=f"sair_{dia['dia']}"):
-                    st.session_state["modo_treino_dia"] = None
-                    st.rerun()
-            else:
-                if st.button(f"▶ Iniciar treino guiado — {dia['dia']}", key=f"iniciar_{dia['dia']}"):
-                    st.session_state["modo_treino_dia"] = dia["dia"]
-                    st.rerun()
+        abas = st.tabs([dia["dia"] for dia in plano])
+        for aba, dia in zip(abas, plano):
+            with aba:
+                for bloco in dia["blocos"]:
+                    st.markdown(f"<div class='grp-label'>{NOME_GRUPO[bloco['grupo']]}</div>", unsafe_allow_html=True)
+                    for ex in bloco["exercicios"]:
+                        st.markdown(f"""
+                            <div class="ex-card">
+                              <div class="ex-top">
+                                <span class="ex-nome">{ex['nome']}<span class="ex-nivel">{'●' * ex['nivel']}</span></span>
+                                <span class="ex-scheme">{ex['series']}x {ex['carga']} · descanso {ex['descanso']}</span>
+                              </div>
+                              <div class="ex-dica">{ex['dica']}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        video_id = buscar_video_youtube(ex["nome"])
+                        if video_id:
+                            with st.expander(f"▶ Ver demonstração — {ex['nome']}"):
+                                st.video(f"https://www.youtube.com/watch?v={video_id}")
+                        else:
+                            st.markdown(
+                                f"<a class='ex-link' href='{link_video(ex['nome'])}' target='_blank'>"
+                                f"Ver demonstração ↗</a>",
+                                unsafe_allow_html=True,
+                            )
 
-    st.divider()
-    if st.button("✓ Concluí o treino de hoje"):
-        novo_perfil = registrar_sessao_concluida(nome_atual)
-        st.session_state["perfil"] = novo_perfil
-        st.success(f"Treino registrado! Total: {novo_perfil['sessoes_concluidas']} treinos concluídos.")
-        st.rerun()
+                if st.session_state["modo_treino_dia"] == dia["dia"]:
+                    passos = construir_passos_treino(dia)
+                    components.html(montar_widget_treino_guiado(passos, dia["dia"]), height=560, scrolling=False)
+                    if st.button("Sair do modo guiado", key=f"sair_{dia['dia']}"):
+                        st.session_state["modo_treino_dia"] = None
+                        st.rerun()
+                else:
+                    if st.button(f"▶ Iniciar treino guiado — {dia['dia']}", key=f"iniciar_{dia['dia']}"):
+                        st.session_state["modo_treino_dia"] = dia["dia"]
+                        st.rerun()
+
+        st.divider()
+        if st.button("✓ Concluí o treino de hoje"):
+            novo_perfil = registrar_sessao_concluida(nome_atual)
+            st.session_state["perfil"] = novo_perfil
+            st.session_state["ver_treino_mesmo_assim"] = False
+            st.success(f"Treino registrado! Total: {novo_perfil['sessoes_concluidas']} treinos concluídos.")
+            st.rerun()
 
     st.divider()
     st.subheader("Dicas de dieta")
