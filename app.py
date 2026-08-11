@@ -23,17 +23,13 @@ SESSOES_POR_NIVEL = 4  # a cada N treinos concluídos, o app sobe um degrau de d
 
 TEXTO_POLITICA_PRIVACIDADE = """
 **O que coletamos:** nome, email e senha (guardada de forma criptografada,
-nunca em texto puro), além do seu histórico de treinos (datas e progressão)
-e o status da sua assinatura.
+nunca em texto puro), além do seu histórico de treinos (datas e progressão).
 
 **Peso, altura e idade** são usados só para calcular seu treino na hora —
 não ficam salvos em nenhum lugar.
 
 **Onde fica guardado:** seus dados de conta e histórico ficam numa planilha
 do Google Sheets, acessível apenas pela conta que administra o FORJA.
-
-**Pagamentos:** processados pela Cakto; não temos acesso ao número do seu
-cartão nem dados bancários completos.
 
 **Seus direitos:** você pode pedir a exclusão da sua conta e dos seus dados
 a qualquer momento, entrando em contato pelo email de suporte do FORJA.
@@ -46,16 +42,8 @@ específicas sobre como seus dados são tratados, entre em contato._
 """
 
 TEXTO_TERMOS_DE_USO = """
-**Assinatura:** o FORJA custa R$14,99/mês, com 3 dias de teste
-grátis pra novas contas. A cobrança é recorrente e automática (via Cakto),
-até você cancelar.
-
-**Cancelamento:** pode ser feito a qualquer momento diretamente na Cakto
-(no link de gerenciamento da assinatura que você recebeu por email na
-compra). Após cancelar, você mantém acesso até o fim do período já pago.
-
-**Reembolso:** segue a política padrão da Cakto para o período de
-arrependimento previsto em lei (7 dias corridos a partir da compra).
+**Acesso:** o FORJA é 100% gratuito. Não há assinatura, cobrança ou período
+de teste — toda conta tem acesso completo, sem limite de tempo.
 
 **Uso aceitável:** sua conta é pessoal e intransferível. Não compartilhe
 seu login com outras pessoas.
@@ -583,11 +571,6 @@ def salvar_usuarios(usuarios):
     carregar_usuarios.clear()
 
 
-DIAS_TESTE_GRATIS = 3
-DIAS_TOLERANCIA = 3
-PRECO_MENSAL = "R$14,99"
-
-
 def criar_conta(email, senha, nome):
     email = email.strip().lower()
     if not email or "@" not in email:
@@ -596,20 +579,19 @@ def criar_conta(email, senha, nome):
     if email in usuarios:
         return False, "Esse email já tem cadastro. Faça login na aba ao lado."
     hash_, salt = _gerar_hash_senha(senha)
-    validade_teste = (datetime.now() + timedelta(days=DIAS_TESTE_GRATIS)).strftime("%Y-%m-%d")
     usuarios[email] = {
         "senha_hash": hash_,
         "senha_salt": salt,
         "nome": nome.strip(),
-        "assinatura_status": "teste",
-        "assinatura_valido_ate": validade_teste,
+        "assinatura_status": "gratuito",
+        "assinatura_valido_ate": "",
         "data_cadastro": datetime.now().strftime("%d/%m/%Y %H:%M"),
         "reset_codigo": "",
         "reset_expira": "",
         "meses_pagos": "0",
     }
     salvar_usuarios(usuarios)
-    return True, f"Conta criada! Você já tem {DIAS_TESTE_GRATIS} dias de teste grátis. Entre na aba \"Entrar\"."
+    return True, "Conta criada! Entre na aba \"Entrar\"."
 
 
 def autenticar(email, senha):
@@ -624,26 +606,9 @@ def autenticar(email, senha):
 
 
 def status_acesso(usuario):
-    """Retorna um dict descrevendo se o acesso está liberado agora, considerando
-    teste grátis, assinatura ativa e o período de tolerância após o vencimento."""
-    status = usuario.get("assinatura_status")
-    validade_str = usuario.get("assinatura_valido_ate")
-    if status not in ("teste", "ativa") or not validade_str:
-        return {"liberado": False, "motivo": status or "sem_assinatura", "dias_restantes": 0, "em_tolerancia": False}
-
-    try:
-        validade = datetime.strptime(str(validade_str), "%Y-%m-%d").date()
-    except ValueError:
-        return {"liberado": False, "motivo": "sem_assinatura", "dias_restantes": 0, "em_tolerancia": False}
-
-    hoje = datetime.now().date()
-    fim_tolerancia = validade + timedelta(days=DIAS_TOLERANCIA)
-
-    if hoje <= validade:
-        return {"liberado": True, "motivo": status, "dias_restantes": (validade - hoje).days, "em_tolerancia": False}
-    if hoje <= fim_tolerancia:
-        return {"liberado": True, "motivo": status, "dias_restantes": (fim_tolerancia - hoje).days, "em_tolerancia": True}
-    return {"liberado": False, "motivo": "expirado", "dias_restantes": 0, "em_tolerancia": False}
+    """FORJA agora é 100% gratuito — acesso sempre liberado pra qualquer conta.
+    Mantém o mesmo formato de retorno de antes pra não quebrar o resto do código."""
+    return {"liberado": True, "motivo": "gratuito", "dias_restantes": 0, "em_tolerancia": False}
 
 
 def assinatura_esta_ativa(usuario):
@@ -1358,63 +1323,36 @@ def dicas_dieta(motivos, imc, idade):
 # ---------------------------------------------------------------------------
 if st.query_params.get("admin") == "1":
     st.title("📊 Painel — FORJA")
-    senha_admin = st.text_input("Senha de administrador", type="password")
+    senha_admin = st.text_input("Senha de administrador", type="password", key="senha_admin")
     if senha_admin and senha_admin == st.secrets.get("admin_senha", None):
         usuarios = carregar_usuarios()
         total = len(usuarios)
-        ativos = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "ativa")
-        em_teste = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "teste")
-        cancelados = sum(1 for u in usuarios.values() if u.get("assinatura_status") == "cancelada")
-        receita_estimada = ativos * 14.99
-        receita_total_recebida = sum(int(u.get("meses_pagos") or 0) for u in usuarios.values()) * 14.99
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Contas totais", total)
-        col2.metric("Assinaturas ativas", ativos)
-        col3.metric("Em teste grátis", em_teste)
-        col4.metric("Canceladas", cancelados)
-
-        col5, col6 = st.columns(2)
-        col5.metric("Receita mensal estimada", f"R$ {receita_estimada:.2f}")
-        col6.metric("Total já recebido (histórico)", f"R$ {receita_total_recebida:.2f}")
-
-        st.divider()
         hoje = datetime.now().date()
-        vencendo = []
-        for email, dados in usuarios.items():
-            if dados.get("assinatura_status") not in ("ativa", "teste"):
-                continue
+        novas_essa_semana = 0
+        for dados in usuarios.values():
             try:
-                validade = datetime.strptime(str(dados.get("assinatura_valido_ate", "")), "%Y-%m-%d").date()
+                data_cad = datetime.strptime(dados.get("data_cadastro", ""), "%d/%m/%Y %H:%M").date()
+                if (hoje - data_cad).days <= 7:
+                    novas_essa_semana += 1
             except ValueError:
-                continue
-            dias_restantes = (validade - hoje).days
-            if 0 <= dias_restantes <= 3:
-                vencendo.append((dados.get("nome", ""), email, dias_restantes))
+                pass
 
-        if vencendo:
-            st.subheader("⏰ Vencendo nos próximos 3 dias")
-            for nome, email, dias in sorted(vencendo, key=lambda x: x[2]):
-                st.warning(f"**{nome}** ({email}) — vence em {dias} dia(s)")
+        col1, col2 = st.columns(2)
+        col1.metric("Contas totais", total)
+        col2.metric("Novas contas (últimos 7 dias)", novas_essa_semana)
 
         st.divider()
         st.subheader("Lista de contas")
         for email, dados in usuarios.items():
-            total_pago = int(dados.get("meses_pagos") or 0) * 14.99
-            st.write(
-                f"**{dados.get('nome','')}** ({email}) — status: `{dados.get('assinatura_status','')}` "
-                f"— válido até: {dados.get('assinatura_valido_ate','—')} "
-                f"— total pago: R$ {total_pago:.2f}"
-            )
+            st.write(f"**{dados.get('nome','')}** ({email}) — cadastro: {dados.get('data_cadastro','—')}")
     elif senha_admin:
         st.error("Senha incorreta.")
     st.stop()
 
 
 # ---------------------------------------------------------------------------
-# TELA DE ACESSO (login, cadastro e verificação de assinatura)
+# TELA DE ACESSO (login e cadastro — FORJA é 100% grátis)
 # ---------------------------------------------------------------------------
-LINK_ASSINATURA = "https://pay.cakto.com.br/uga7e39_979154"  # troque pelo link da assinatura mensal na Cakto
 
 
 def montar_cabecalho(nome=None, emoji_patente=None, nome_patente=None):
@@ -1442,7 +1380,7 @@ if "reset_email_enviado" not in st.session_state:
 
 if st.session_state["usuario_logado"] is None:
     st.markdown(montar_cabecalho(), unsafe_allow_html=True)
-    st.write(f"Entre na sua conta FORJA ou crie uma nova — {DIAS_TESTE_GRATIS} dias de teste grátis.")
+    st.write("Entre na sua conta FORJA ou crie uma nova — é 100% grátis.")
     aba_entrar, aba_criar, aba_esqueci = st.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
 
     with aba_entrar:
@@ -1532,44 +1470,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not status["liberado"]:
-    st.write(f"Olá, {usuario_logado.get('nome', '')}!")
-    if status["motivo"] == "expirado":
-        st.write(f"Seu período de acesso acabou. Assine por **{PRECO_MENSAL}/mês** pra continuar.")
-    else:
-        st.write(f"Sua assinatura não está ativa ainda. Assine por **{PRECO_MENSAL}/mês** pra liberar o acesso.")
-    st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
-    st.caption(f"Use este mesmo email no checkout ({usuario_logado['email']}), pra liberação automática.")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Já assinei, verificar de novo"):
-            recarregar_usuario_logado()
-            st.rerun()
-    with col_b:
-        if st.button("Sair da conta"):
-            st.session_state["usuario_logado"] = None
-            st.rerun()
-    st.stop()
-
-if status["em_tolerancia"]:
-    rotulo_periodo = "teste grátis" if status["motivo"] == "teste" else "assinatura"
-    st.warning(
-        f"Seu(a) {rotulo_periodo} venceu, mas você ainda tem {status['dias_restantes']} dia(s) de tolerância. "
-        f"Assine pra não perder o acesso."
-    )
-    st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
-elif status["motivo"] == "teste":
-    col_info, col_btn = st.columns([2, 1])
-    with col_info:
-        st.info(f"Você está no teste grátis — {status['dias_restantes']} dia(s) restante(s).")
-    with col_btn:
-        st.link_button(f"Assinar agora — {PRECO_MENSAL}/mês ↗", LINK_ASSINATURA)
-
 with st.expander(f"👤 {usuario_logado.get('nome','')}"):
-    if status["motivo"] == "teste":
-        st.write(f"Teste grátis válido até {usuario_logado.get('assinatura_valido_ate','')}.")
-    else:
-        st.write(f"Assinatura válida até {usuario_logado.get('assinatura_valido_ate','')}.")
     if st.button("Sair da conta", key="sair_logado"):
         st.session_state["usuario_logado"] = None
         st.rerun()
