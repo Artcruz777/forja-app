@@ -42,8 +42,9 @@ específicas sobre como seus dados são tratados, entre em contato._
 """
 
 TEXTO_TERMOS_DE_USO = """
-**Acesso:** o FORJA é 100% gratuito. Não há assinatura, cobrança ou período
-de teste — toda conta tem acesso completo, sem limite de tempo.
+**Acesso:** o FORJA vem incluído na compra do guia Calistenia para Iniciantes
+(pagamento único). Não há assinatura nem mensalidade — quem comprou cria a conta
+com o mesmo email da compra e tem acesso completo, sem limite de tempo.
 
 **Uso aceitável:** sua conta é pessoal e intransferível. Não compartilhe
 seu login com outras pessoas.
@@ -571,6 +572,42 @@ def salvar_usuarios(usuarios):
     carregar_usuarios.clear()
 
 
+# Quem comprou o guia fica na aba "compradores" da planilha. Só esses emails
+# podem criar conta nova; contas que já existem continuam funcionando.
+COLUNAS_COMPRADORES = ["email", "data_inclusao"]
+COMPRADORES_ARQUIVO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compradores.json")
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def carregar_compradores():
+    if _sheets_disponivel():
+        aba = _obter_worksheet("compradores", COLUNAS_COMPRADORES)
+        return {str(l.get("email", "")).strip().lower() for l in aba.get_all_records()} - {""}
+    if os.path.exists(COMPRADORES_ARQUIVO):
+        try:
+            with open(COMPRADORES_ARQUIVO, "r", encoding="utf-8") as f:
+                return {e.strip().lower() for e in json.load(f)} - {""}
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def adicionar_compradores(emails):
+    """Inclui emails novos na lista de compradores e devolve quantos entraram."""
+    atuais = carregar_compradores()
+    novos = sorted({e.strip().lower() for e in emails if "@" in e} - atuais)
+    if not novos:
+        return 0
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M")
+    if _sheets_disponivel():
+        _obter_worksheet("compradores", COLUNAS_COMPRADORES).append_rows([[e, agora] for e in novos])
+    else:
+        with open(COMPRADORES_ARQUIVO, "w", encoding="utf-8") as f:
+            json.dump(sorted(atuais | set(novos)), f, ensure_ascii=False, indent=2)
+    carregar_compradores.clear()
+    return len(novos)
+
+
 def criar_conta(email, senha, nome):
     email = email.strip().lower()
     if not email or "@" not in email:
@@ -578,12 +615,15 @@ def criar_conta(email, senha, nome):
     usuarios = carregar_usuarios()
     if email in usuarios:
         return False, "Esse email já tem cadastro. Faça login na aba ao lado."
+    if email not in carregar_compradores():
+        return False, ("Esse email não está na lista de compradores do guia. Use o mesmo email "
+                       "da compra. Se acabou de comprar, aguarde alguns minutos e tente de novo.")
     hash_, salt = _gerar_hash_senha(senha)
     usuarios[email] = {
         "senha_hash": hash_,
         "senha_salt": salt,
         "nome": nome.strip(),
-        "assinatura_status": "gratuito",
+        "assinatura_status": "comprador",
         "assinatura_valido_ate": "",
         "data_cadastro": datetime.now().strftime("%d/%m/%Y %H:%M"),
         "reset_codigo": "",
@@ -606,7 +646,7 @@ def autenticar(email, senha):
 
 
 def status_acesso(usuario):
-    """FORJA agora é 100% gratuito — acesso sempre liberado pra qualquer conta.
+    """Quem tem conta tem acesso liberado (a compra é conferida na criação da conta).
     Mantém o mesmo formato de retorno de antes pra não quebrar o resto do código."""
     return {"liberado": True, "motivo": "gratuito", "dias_restantes": 0, "em_tolerancia": False}
 
@@ -1337,9 +1377,23 @@ if st.query_params.get("admin") == "1":
             except ValueError:
                 pass
 
-        col1, col2 = st.columns(2)
+        compradores = carregar_compradores()
+        col1, col2, col3 = st.columns(3)
         col1.metric("Contas totais", total)
         col2.metric("Novas contas (últimos 7 dias)", novas_essa_semana)
+        col3.metric("Compradores liberados", len(compradores))
+
+        st.divider()
+        st.subheader("Liberar compradores")
+        st.caption("Cole os emails de quem comprou o guia (um por linha, ou separados por vírgula). "
+                   "Só esses emails conseguem criar conta.")
+        with st.form("form_compradores"):
+            texto_emails = st.text_area("Emails dos compradores", key="emails_compradores")
+            liberar = st.form_submit_button("Liberar acesso")
+        if liberar:
+            lista = texto_emails.replace(",", "\n").replace(";", "\n").splitlines()
+            qtd = adicionar_compradores(lista)
+            st.success(f"{qtd} email(s) novo(s) liberado(s).") if qtd else st.info("Nenhum email novo pra liberar.")
 
         st.divider()
         st.subheader("Lista de contas")
@@ -1351,7 +1405,7 @@ if st.query_params.get("admin") == "1":
 
 
 # ---------------------------------------------------------------------------
-# TELA DE ACESSO (login e cadastro — FORJA é 100% grátis)
+# TELA DE ACESSO (login e cadastro — criar conta exige email de comprador)
 # ---------------------------------------------------------------------------
 
 
@@ -1380,7 +1434,8 @@ if "reset_email_enviado" not in st.session_state:
 
 if st.session_state["usuario_logado"] is None:
     st.markdown(montar_cabecalho(), unsafe_allow_html=True)
-    st.write("Entre na sua conta FORJA ou crie uma nova — é 100% grátis.")
+    st.write("Entre na sua conta FORJA. Pra criar conta, use o mesmo email com que você comprou "
+             "o guia Calistenia para Iniciantes — o acesso ao site vem incluído na compra.")
     aba_entrar, aba_criar, aba_esqueci = st.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
 
     with aba_entrar:
